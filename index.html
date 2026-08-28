@@ -61,6 +61,18 @@
     font-size:16px;background:#fafafa;
   }
   .field input:focus{outline:none;border-color:var(--green);background:#fff;}
+  .suggestion-list{
+    position:absolute;top:100%;left:0;right:0;z-index:60;
+    background:#fff;border:1.5px solid var(--green);border-top:none;
+    border-radius:0 0 10px 10px;max-height:200px;overflow-y:auto;
+    box-shadow:0 4px 10px rgba(0,0,0,.08);
+  }
+  .suggestion-list .sug-item{
+    padding:10px 14px;font-size:14px;cursor:pointer;border-bottom:1px solid #f0f0f0;
+  }
+  .suggestion-list .sug-item:last-child{border-bottom:none;}
+  .suggestion-list .sug-item:active,.suggestion-list .sug-item:hover{background:var(--green-light);}
+  .suggestion-list .sug-item .sug-sub{display:block;font-size:12px;color:var(--muted);margin-top:2px;}
   .btn{
     width:100%;padding:15px;border:none;border-radius:10px;
     font-size:16px;font-weight:700;cursor:pointer;
@@ -172,9 +184,8 @@
     <!-- ================= SCAN SCREEN ================= -->
     <div id="scanScreen" class="hidden">
       <div class="card">
-        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <div class="section-title">
           <span>Scan Forklift QR Code</span>
-          <button class="btn-outline" style="width:auto;padding:6px 12px;font-size:12px;margin-top:0;border-radius:8px;" onclick="refreshScanner()">⟳ Refresh</button>
         </div>
         <div id="qr-reader"></div>
         <div id="startCameraWrap" style="text-align:center;padding:20px 0;">
@@ -183,9 +194,10 @@
         <div class="scan-status" id="scanStatus"></div>
         <div class="manual-toggle" onclick="toggleManual()">Enter code manually instead</div>
         <div id="manualEntry" class="hidden" style="margin-top:14px;">
-          <div class="field">
+          <div class="field" style="position:relative;">
             <label>Vehicle Code</label>
             <input type="text" id="manualCode" placeholder="e.g. DF01" autocomplete="off" style="text-transform:uppercase;">
+            <div id="manualCodeSuggestions" class="suggestion-list hidden"></div>
           </div>
           <button class="btn btn-outline" onclick="submitManualCode()">Lookup Vehicle</button>
         </div>
@@ -205,9 +217,8 @@
       </div>
 
       <div class="card">
-        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <div class="section-title">
           <span>Last Consumption</span>
-          <button class="btn-outline" style="width:auto;padding:6px 12px;font-size:12px;margin-top:0;border-radius:8px;" onclick="refreshVehicleData()">⟳ Refresh</button>
         </div>
         <div class="info-row">
           <div class="label">Date &amp; Time</div>
@@ -238,9 +249,10 @@
           <label>Vehicle Meter Reading</label>
           <input type="number" id="entryMeter" placeholder="e.g. 4580" inputmode="decimal" min="0">
         </div>
-        <div class="field">
+        <div class="field" style="position:relative;">
           <label>Driver ID / Mobile Number</label>
           <input type="text" id="driverLookup" placeholder="e.g. DR-1025 or 017XXXXXXXX" autocomplete="off">
+          <div id="driverSuggestions" class="suggestion-list hidden"></div>
           <div id="driverStatus" style="font-size:12px;margin-top:6px;"></div>
         </div>
         <div class="field">
@@ -276,6 +288,8 @@
 const SUPABASE_URL = "https://oshqaazzteqqukilghev.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9zaHFhYXp6dGVxcXVraWxnaGV2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU3Mzc4ODYsImV4cCI6MjEwMTMxMzg4Nn0.Rz33PdqBlq9yWqgNiz_4B_2fG6B3ztpk3dTx44He4F0";
 
+
+
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 /* ============ STATE ============ */
@@ -284,6 +298,7 @@ let html5QrCode = null;
 let scanLocked = false;
 let matchedDriver = null; // { name, id_or_mobile } once a valid driver is found
 let driverSearchTimer = null;
+let vehicleListCache = null; // [{code, vehicle_name}] loaded once, reused for manual-code suggestions
 
 /* ============ INIT ============ */
 document.addEventListener("DOMContentLoaded", () => {
@@ -298,11 +313,67 @@ document.addEventListener("DOMContentLoaded", () => {
     showScreen("login");
   }
 
-  document.getElementById("driverLookup").addEventListener("input", () => {
+  const manualCodeInput = document.getElementById("manualCode");
+  manualCodeInput.addEventListener("input", onManualCodeInput);
+  manualCodeInput.addEventListener("focus", onManualCodeInput);
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#manualEntry")) hideSuggestions("manualCodeSuggestions");
+  });
+
+  const driverInput = document.getElementById("driverLookup");
+  driverInput.addEventListener("input", () => {
     clearTimeout(driverSearchTimer);
-    driverSearchTimer = setTimeout(searchDriver, 400); // debounce
+    driverSearchTimer = setTimeout(searchDriver, 400); // debounce, also renders suggestions
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#driverLookup") && !e.target.closest("#driverSuggestions")) {
+      hideSuggestions("driverSuggestions");
+    }
   });
 });
+
+function hideSuggestions(elId) {
+  const el = document.getElementById(elId);
+  el.classList.add("hidden");
+  el.innerHTML = "";
+}
+
+/* ============ VEHICLE CODE AUTOSUGGEST (manual entry) ============ */
+async function loadVehicleListCache() {
+  if (vehicleListCache) return vehicleListCache; // load once, reuse
+  const { data, error } = await sb.from("master").select("code, vehicle_name").order("code");
+  if (error) { console.error(error); return []; }
+  vehicleListCache = data || [];
+  return vehicleListCache;
+}
+
+async function onManualCodeInput() {
+  const input = document.getElementById("manualCode");
+  const val = input.value.trim().toLowerCase();
+  const box = document.getElementById("manualCodeSuggestions");
+
+  const list = await loadVehicleListCache();
+  const matches = val
+    ? list.filter(v => v.code.toLowerCase().includes(val) || v.vehicle_name.toLowerCase().includes(val)).slice(0, 8)
+    : list.slice(0, 8); // show a few options even before typing, on focus
+
+  if (matches.length === 0) { hideSuggestions("manualCodeSuggestions"); return; }
+
+  box.innerHTML = matches.map(v =>
+    '<div class="sug-item" data-code="' + escapeHtml(v.code) + '">' +
+    '<strong>' + escapeHtml(v.code) + '</strong>' +
+    '<span class="sug-sub">' + escapeHtml(v.vehicle_name) + '</span>' +
+    '</div>'
+  ).join("");
+  box.classList.remove("hidden");
+
+  box.querySelectorAll(".sug-item").forEach(item => {
+    item.addEventListener("click", () => {
+      input.value = item.getAttribute("data-code");
+      hideSuggestions("manualCodeSuggestions");
+    });
+  });
+}
 
 /* ============ LOCAL STORAGE HELPERS ============ */
 /* Still fine to keep the operator's own session in localStorage -   */
@@ -462,11 +533,11 @@ async function startScanner() {
     const name = err && err.name;
     let reason = "Camera not available. Use manual entry below.";
     if (name === "NotAllowedError") {
-      reason = "Camera permission was denied. Please allow camera access in your browser settings, then tap Refresh.";
+      reason = "Camera permission was denied. Please allow camera access in your browser settings, then tap Start Camera again.";
     } else if (name === "NotFoundError") {
       reason = "No camera found on this device. Use manual entry below.";
     } else if (name === "NotReadableError") {
-      reason = "Camera is already in use by another app or browser tab. Close it and tap Refresh.";
+      reason = "Camera is already in use by another app or browser tab. Close it and try Start Camera again.";
     } else if (name === "OverconstrainedError") {
       reason = "No camera matched the required settings. Use manual entry below.";
     }
@@ -481,39 +552,6 @@ function stopScanner() {
       html5QrCode.clear();
     }).catch(() => {});
   }
-}
-
-/* ============ REFRESH ============ */
-function refreshScanner() {
-  // Just resets/reinitializes the scanner — no historical data reload.
-  stopScanner();
-  document.getElementById("manualEntry").classList.add("hidden");
-  document.getElementById("manualCode").value = "";
-  startScanner();
-}
-
-async function refreshVehicleData() {
-  // Re-fetches only this vehicle's latest_data row — not the full history.
-  if (!currentVehicle) return;
-  const btn = event ? event.target : null;
-  if (btn) { btn.disabled = true; btn.textContent = "Refreshing..."; }
-
-  try {
-    const { data: lastEntry, error } = await sb
-      .from("latest_data")
-      .select("entry_datetime, quantity, meter_reading")
-      .eq("code", currentVehicle.code)
-      .maybeSingle();
-    if (error) throw error;
-
-    currentVehicle.datetime = lastEntry ? lastEntry.entry_datetime : null;
-    currentVehicle.quantity = lastEntry ? lastEntry.quantity : null;
-    currentVehicle.meterReading = lastEntry ? lastEntry.meter_reading : null;
-    renderLastConsumption(currentVehicle);
-  } catch (err) {
-    console.error(err);
-  }
-  if (btn) { btn.disabled = false; btn.textContent = "⟳ Refresh"; }
 }
 
 function toggleManual() {
